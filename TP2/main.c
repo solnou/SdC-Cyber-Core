@@ -4,115 +4,91 @@
 #include <curl/curl.h>
 #include <cjson/cJSON.h>
 
-struct MemoryStruct {
-    char *memory;
-    size_t size;
-};
-
-// Write callback for libcurl
-static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
-    size_t realsize = size * nmemb;
-    struct MemoryStruct *mem = (struct MemoryStruct *)userp;
-
-    char *ptr = realloc(mem->memory, mem->size + realsize + 1);
-    if(ptr == NULL) return 0;  // out of memory
-
-    mem->memory = ptr;
-    memcpy(&(mem->memory[mem->size]), contents, realsize);
-    mem->size += realsize;
-    mem->memory[mem->size] = 0;
-
-    return realsize;
-}
-
-// Extracts "value" fields from JSON
-double* extract_gini_values(const char* json_text, int* out_count) {
-    cJSON* root = cJSON_Parse(json_text);
-    if (!root || !cJSON_IsArray(root)) {
-        fprintf(stderr, "Invalid JSON\n");
-        return NULL;
-    }
-
-    cJSON* data_array = cJSON_GetArrayItem(root, 1);
-    if (!cJSON_IsArray(data_array)) {
-        fprintf(stderr, "Invalid data array\n");
-        cJSON_Delete(root);
-        return NULL;
-    }
-
-    int count = cJSON_GetArraySize(data_array);
-    double* values = malloc(count * sizeof(double));
-    int actual_count = 0;
-
-    for (int i = 0; i < count; i++) {
-        cJSON* item = cJSON_GetArrayItem(data_array, i);
-        if (!item) continue;
-
-        cJSON* value_field = cJSON_GetObjectItem(item, "value");
-        if (value_field && cJSON_IsNumber(value_field)) {
-            values[actual_count++] = value_field->valuedouble;
-        }
-    }
-
-    cJSON_Delete(root);
-    *out_count = actual_count;
-    return values;
-}
-
-// Assembly function declaration
+// Importamos la funcion externa de assembler
 extern void convert_to_ints(double* in, int* out, int count);
 
-int main(void)
-{
-    CURL *curl;
-    CURLcode res;
+// Estructura para la respuesta de la API en memoria
+struct Memory {
+    char *data;   // Puntero al buffer de datos
+    size_t size;  // Tamaño actual del buffer
+};
 
-    struct MemoryStruct chunk;
-    chunk.memory = malloc(1);  // will be grown by realloc
-    chunk.size = 0;
+// Callback para escribir los datos recibidos por libcurl en memoria
+static size_t write_cb(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t new_data = size * nmemb;  // Calcula el tamaño de los nuevos datos
+    struct Memory *mem = userp;
 
-    curl_global_init(CURL_GLOBAL_ALL);
-    curl = curl_easy_init();
-    if(curl) {
-        curl_easy_setopt(curl, CURLOPT_URL, "https://api.worldbank.org/v2/en/country/AR/indicator/SI.POV.GINI?format=json&date=2011:2022");
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+    // Realoca memoria para almacenar los nuevos datos
+    mem->data = realloc(mem->data, mem->size + new_data + 1);
+    if (!mem->data) return 0;  // maneja error
 
-        res = curl_easy_perform(curl);
-        if(res != CURLE_OK) {
-            fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
-            return 1;
-        }
+    // Copia los nuevos datos al buffer y actualiza el tamaño
+    memcpy(mem->data + mem->size, contents, new_data);
+    mem->size += new_data;
+    mem->data[mem->size] = '\0';  // Asegura que el buffer termine en un carácter nulo
+    return new_data;
+}
 
-        curl_easy_cleanup(curl);
+// Función para extraer los valores "value" del JSON recibido
+double* get_gini_values(const char *json, int *count) {
+    cJSON *root = cJSON_Parse(json);  
+    if (!root) return NULL;  // manejo de errores
+
+    // Obtiene el segundo elemento (donde estan los datos)
+    cJSON *arr = cJSON_GetArrayItem(root, 1);
+    int n = cJSON_GetArraySize(arr);  // Obtiene el tamaño del arreglo
+    double *vals = malloc(n * sizeof(double));  // Reserva memoria para los valores
+    int j = 0;
+
+    // Itera y busca los valores "value"
+    for (int i = 0; i < n; i++) {
+        cJSON *item = cJSON_GetArrayItem(arr, i);
+        cJSON *v = cJSON_GetObjectItem(item, "value");
+        if (cJSON_IsNumber(v)) vals[j++] = v->valuedouble;  // Almacena los valores numéricos
     }
+
+    cJSON_Delete(root);  // Libera la memoria del JSON
+    *count = j;  // Devuelve la cantidad de valores extraídos
+    return vals;  // Retorna el arreglo de valores
+}
+
+int main() {
+
+    // Inicializa libcurl
+    curl_global_init(CURL_GLOBAL_ALL);
+    CURL *curl = curl_easy_init();
+    struct Memory mem = { malloc(1), 0 };  // Inicializa la estructura para almacenar la respuesta
+
+    if (!curl) return 1;  // manejo de errores
+
+    // Configura la solicitud HTTPS
+    curl_easy_setopt(curl, CURLOPT_URL, "https://api.worldbank.org/v2/en/country/AR/indicator/SI.POV.GINI?format=json&date=2011:2022");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);  // Usa el callback para escribir datos
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &mem);  // Pasa la estructura para almacenar los datos
+    curl_easy_perform(curl);  // Realiza la solicitud
+    curl_easy_cleanup(curl);  // Limpia la sesión
 
     int count = 0;
-    double* values = extract_gini_values(chunk.memory, &count);
-    free(chunk.memory);
+    // Extrae los valores GINI del JSON recibido
+    double *gini = get_gini_values(mem.data, &count);
+    free(mem.data);  // Libera la memoria del buffer de respuesta
+    if (!gini) return 1;  // manejo de errores
 
-    if (!values) return 1;
+    // salida por pantalla con los valores GINI
+    printf("Valores GINI encontrados: %d\n", count);
 
-    double sum = 0;
-    for (int i = 0; i < count; i++) {
-        sum += values[i];
-    }
+    // Convierte los valores GINI a enteros usando la función en ensamblador
+    int *converted = malloc(count * sizeof(int));
+    convert_to_ints(gini, converted, count);
 
-    printf("Gini value count: %d\n", count);
-    printf("Sum of Gini values: %.2f\n", sum);
+    // Imprime los valores convertidos a enteros
+    puts("Valores convertidos a enteros:");
+    for (int i = 0; i < count; i++) printf("%d ", converted[i]);
+    puts("");
 
-    // Allocate and convert to integers via NASM
-    int* int_values = malloc(count * sizeof(int));
-    convert_to_ints(values, int_values, count);
-
-    printf("\nInteger-converted values:\n");
-    for (int i = 0; i < count; i++) {
-        printf("int_values[%d] = %d\n", i, int_values[i]);
-    }
-
-    free(values);
-    free(int_values);
-    curl_global_cleanup();
-    return 0;
+    // Libera la memoria reservada
+    free(gini);
+    free(converted);
+    curl_global_cleanup();  // Limpia los recursos globales de libcurl
+    return 0;  // Termina el programa exitosamente
 }
